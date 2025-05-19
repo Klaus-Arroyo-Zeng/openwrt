@@ -1,0 +1,84 @@
+name: Build OpenWrt for JDCloud AX1800 PRO (IPQ6000)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout source
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y build-essential ccache ecj fastjar file g++ gawk \
+          gettext git java-propose-classpath libelf-dev libncurses5-dev \
+          libncursesw5-dev libssl-dev python3 unzip wget zlib1g-dev \
+          qemu-utils rsync
+
+    - name: Clone Lienol OpenWrt
+      run: |
+        git clone --depth=1 https://github.com/Lienol/openwrt lienol
+        cd lienol
+
+    - name: Update & Install Feeds
+      run: |
+        cd lienol
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Add nikki plugin
+      run: |
+        cd lienol/package
+        git clone https://github.com/nikkinikki-org/OpenWrt-nikki.git
+
+    - name: Configure build
+      run: |
+        cd lienol
+        cat <<EOF > .config
+        # Target platform: IPQ60xx
+        CONFIG_TARGET_ipq60xx=y
+        CONFIG_TARGET_ipq60xx_generic=y
+        CONFIG_TARGET_ipq60xx_generic_DEVICE_jdcloud_ax1800pro=y
+
+        # Nikki
+        CONFIG_PACKAGE_nikki=y
+
+        # Docker
+        CONFIG_PACKAGE_docker=y
+        CONFIG_PACKAGE_dockerd=y
+        CONFIG_PACKAGE_luci-app-docker=y
+
+        # IPv6
+        CONFIG_PACKAGE_ipv6helper=y
+        CONFIG_PACKAGE_dnsmasq_full_dhcpv6=y
+        CONFIG_PACKAGE_odhcp6c=y
+        CONFIG_PACKAGE_odhcpd-ipv6only=y
+        CONFIG_PACKAGE_kmod-ipv6=y
+        CONFIG_PACKAGE_kmod-sit=y
+        CONFIG_PACKAGE_kmod-wireguard=y
+
+        # System
+        CONFIG_DEVEL=y
+        CONFIG_CCACHE=y
+        EOF
+
+        make defconfig
+
+    - name: Build firmware
+      run: |
+        cd lienol
+        make download -j$(nproc) || make download -j1 V=s
+        make -j$(nproc) || make -j1 V=s
+
+    - name: Upload firmware
+      uses: actions/upload-artifact@v4
+      with:
+        name: OpenWrt-JDCloud-AX1800PRO
+        path: lienol/bin/targets/
