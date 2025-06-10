@@ -1,84 +1,192 @@
-name: Build OpenWrt for JDCloud AX1800 PRO (IPQ6000)
+name: Build OpenWrt
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
+    inputs:
+        ssh:
+          description: "Enable SSH debugging"
+          required: false
+          default: "true"
+  # schedule:
+  #   - cron: '0 20 * * *'
+env:
+  REPO_URL: https://github.com/Lienol/openwrt
+  REPO_BRANCH: 24.10
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: .config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
+    # strategy:
+    #   matrix:
+    #     include:
+    #       - name: JDcloud_AX1800PRO
+    #         config: JDcloud_AX1800PRO.config
+          # - name: N1
+          #   config: N1.config
+
+    # name: Build ${{ matrix.name }}
+
     steps:
-    - name: Checkout source
-      uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Free up disk space
+        run: |
+          echo "Before cleanup:"
+          df -h
+      
+          # 删除不必要的包和文档
+          sudo apt-get remove -y '^dotnet-.*' '^aspnetcore-.*' '^mysql-.*' || true
+          sudo apt-get remove -y 'php.*' 'mongodb.*' 'llvm.*' || true
+          sudo apt-get autoremove -y
+          sudo apt-get clean
+      
+          # 删除大文件和缓存
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost || true
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+      
+          echo "After cleanup:"
+          df -h
+      - name: Initialization environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install binutils bzip2 diff find flex gawk gcc-6+ getopt grep install libc-dev libz-dev make4.1+ perl python3.7+ rsync subversion unzip which
+          sudo -E apt-get -qq autoremove --purge
+          sudo -E apt-get -qq clean
+          sudo timedatectl set-timezone "$TZ"
+          sudo mkdir -p /mnt/workdir
+          sudo chown $USER:$GROUPS /mnt/workdir
 
-    - name: Install dependencies
-      run: |
-        sudo apt update
-        sudo apt install -y build-essential ccache ecj fastjar file g++ gawk \
-          gettext git java-propose-classpath libelf-dev libncurses5-dev \
-          libncursesw5-dev libssl-dev python3 unzip wget zlib1g-dev \
-          qemu-utils rsync
 
-    - name: Clone Lienol OpenWrt
-      run: |
-        git clone --depth=1 https://github.com/Lienol/openwrt lienol
-        cd lienol
 
-    - name: Update & Install Feeds
-      run: |
-        cd lienol
-        ./scripts/feeds update -a
-        ./scripts/feeds install -a
+      
+      - name: Clone source code
+        working-directory: /mnt/workdir
+        run: |
+          df -hT $PWD
+          git clone $REPO_URL -b $REPO_BRANCH openwrt
+          ln -sf /mnt/workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
-    - name: Add nikki plugin
-      run: |
-        cd lienol/package
-        git clone https://github.com/nikkinikki-org/OpenWrt-nikki.git
+      - name: Load custom feeds
+        run: |
+          [ -e $FEEDS_CONF ] && mv $FEEDS_CONF /mnt/workdir/openwrt/feeds.conf.default
+          chmod +x $DIY_P1_SH
+          chmod +x $DIY_P2_SH
+          cd /mnt/workdir/openwrt
+          $GITHUB_WORKSPACE/$DIY_P1_SH
+          $GITHUB_WORKSPACE/$DIY_P2_SH
+  
+      - name: Update feeds
+        run: cd /mnt/workdir/openwrt && ./scripts/feeds update -a
+  
+      - name: Install feeds
+        run: cd /mnt/workdir/openwrt && ./scripts/feeds install -a
+      
+      # - name: Load config file
+      #   run: |
+      #     cp configs/${{ matrix.config }} /mnt/workdir/openwrt/.config
+      #     make defconfig
+        
+      - name: Setup tmate session (SSH debug)
+        if: ${{ github.event.inputs.ssh == 'true' || contains(github.event.head_commit.message, '[ssh]') }}
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: false  # 仅允许触发者访问 SSH 会话
+        
 
-    - name: Configure build
-      run: |
-        cd lienol
-        cat <<EOF > .config
-        # Target platform: IPQ60xx
-        CONFIG_TARGET_ipq60xx=y
-        CONFIG_TARGET_ipq60xx_generic=y
-        CONFIG_TARGET_ipq60xx_generic_DEVICE_jdcloud_ax1800pro=y
 
-        # Nikki
-        CONFIG_PACKAGE_nikki=y
+      - name: Download sources
+        id: package
+        run: |
+          cd /mnt/workdir/openwrt
+          make download -j8
+          find dl -size -1024c -exec ls -l {} \;
+          find dl -size -1024c -exec rm -f {} \;
 
-        # Docker
-        CONFIG_PACKAGE_docker=y
-        CONFIG_PACKAGE_dockerd=y
-        CONFIG_PACKAGE_luci-app-docker=y
+      - name: Check space usage
+        if: (!cancelled())
+        run: df -hT
 
-        # IPv6
-        CONFIG_PACKAGE_ipv6helper=y
-        CONFIG_PACKAGE_dnsmasq_full_dhcpv6=y
-        CONFIG_PACKAGE_odhcp6c=y
-        CONFIG_PACKAGE_odhcpd-ipv6only=y
-        CONFIG_PACKAGE_kmod-ipv6=y
-        CONFIG_PACKAGE_kmod-sit=y
-        CONFIG_PACKAGE_kmod-wireguard=y
+      - name: Build OpenWrt
+        id: compile
+        run: |
+          cd /mnt/workdir/openwrt
+          echo -e "$(nproc) thread compile"
+          make -j$(nproc) || make -j1 || make -j1 V=s
+          echo "status=success" >> $GITHUB_OUTPUT
+          grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+          [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+          echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+      
 
-        # System
-        CONFIG_DEVEL=y
-        CONFIG_CCACHE=y
-        EOF
+      - name: Upload bin directory
+        uses: actions/upload-artifact@main
+        if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+        with:
+          name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+          path: openwrt/bin
 
-        make defconfig
+      - name: Organize files
+        id: organize
+        if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+        run: |
+          cd openwrt/bin/targets/*/*
+          rm -rf packages
+          echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+          echo "status=success" >> $GITHUB_OUTPUT
 
-    - name: Build firmware
-      run: |
-        cd lienol
-        make download -j$(nproc) || make download -j1 V=s
-        make -j$(nproc) || make -j1 V=s
+      - name: Upload firmware directory
+        uses: actions/upload-artifact@main
+        if: steps.organize.outputs.status == 'success' && !cancelled()
+        with:
+          name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+          path: ${{ env.FIRMWARE }}
 
-    - name: Upload firmware
-      uses: actions/upload-artifact@v4
-      with:
-        name: OpenWrt-JDCloud-AX1800PRO
-        path: lienol/bin/targets/
+      - name: Generate release tag
+        id: tag
+        if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+        run: |
+          echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+          touch release.txt
+          [ ${UPLOAD_GOFILE} = true && ${{ steps.gofile.outputs.url }} ] && echo "🔗 [GoFile](${{ steps.gofile.outputs.url }})" >> release.txt
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: Upload firmware to release
+        uses: softprops/action-gh-release@master
+        if: steps.tag.outputs.status == 'success' && !cancelled()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.tag.outputs.release_tag }}
+          body_path: release.txt
+          files: ${{ env.FIRMWARE }}/*
+
+      - name: Delete workflow runs
+        uses: Mattraks/delete-workflow-runs@main
+        with:
+          retain_days: 0
+          keep_minimum_runs: 2
+
+      - name: Remove old Releases
+        uses: dev-drprasad/delete-older-releases@master
+        if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+        with:
+          keep_latest: 3
+          delete_tags: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
